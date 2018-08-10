@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 Package: logolink
 Type: Package
 Title: What the Package Does (Title Case)
@@ -8,4 +9,16 @@ Description: More about what it does (maybe more than one line)
     Use four spaces when indenting paragraphs within the Description.
 License: What license is it under?
 Encoding: UTF-8
+=======
+Package: logolink
+Type: Package
+Title: What the Package Does (Title Case)
+Version: 0.1.0
+Author: Who wrote it
+Maintainer: The package maintainer <yourself@somewhere.net>
+Description: More about what it does (maybe more than one line)
+    Use four spaces when indenting paragraphs within the Description.
+License: What license is it under?
+Encoding: UTF-8
+>>>>>>> 9af3d8261947d18665412afd4e5fa77017fc21a3
 LazyData: true
