@@ -1,0 +1,746 @@
+---
+title: "Probabilistic Record Linkage for Chinese Character Data"
+subtitle: "Version 0.1"
+author: "Charles Li, Philip Collender, Audrey Webb, Qu Cheng"
+date: "July 20, 2018"
+output: html_notebook
+---
+#Introduction
+
+The following set of scripts was developed by a research team of Prof. Justin Remais at the University of California, Berkeley School of Public Health for the purpose of matching records corresponding to the same individual across and within Chinese language databases. It is designed to execute a full probabilistic record linkage routine on Chinese character data using various fields of identifying information.
+
+The authors have included an accompanying high-level description of the steps involved in our record linkage approach. The following code is still in active development. Refinements and expansions of its capability and scalability are expected, and users are encouraged to customize it according to their specific needs. 
+
+Please feel free to contact the authors directly with any questions or feedback.
+  
+NOTE: For execution of the algorithms on the example dataset, at least 8 GB RAM is recommended. Execution takes ~ 1 hour in total
+  
+  *Philip Collender*: <pcollender@berkeley.edu> |
+  *Charles Li*: <charlesli@berkeley.edu> (WeChat ID: charlesli37)* |
+  *Audrey Webb*: <awebb@berkeley.edu> |
+  *Qu Cheng*: <qcheng@berkeley.edu> (WeChat ID: canalcheng)*
+  
+*Correspondence to Charles Li or Qu Cheng may be in Chinese.
+
+#Pre-Processing Steps
+
+##1. Initial Setup
+
+###A. Ensure the system locale is set to Chinese (otherwise Chinese characters are parsed incorrectly):
+```{r}
+Sys.setlocale(category = 'LC_ALL', locale = 'chs')
+```
+
+###B. Import required libraries:
+```{r}
+devtools::install_github('pcollender/ChinSimi')
+library(ChinSimi) #https://github.com/canalcheng/ChinSimi - functions for Chinese character conversion to pinyin and FCC and string similarity calculations
+
+reqpackages = c('stringdist','foreach','doParallel','parallel','readr','Matrix','tidyverse')
+
+toinstall = !(reqpackages %in% installed.packages())
+
+if(any(toinstall)) install.packages(pkgs = reqpackages[toinstall])
+
+library(stringdist)
+
+library(foreach)
+library(doParallel)
+library(parallel) #parallelization is recommended to speed up massive calculations, though its utilization is limited in the vignette presented here
+
+library(readr)
+library(Matrix)
+library(tidyverse)
+
+source('Linkage Models/corlink2.R') #set to path where you have stored the corlink2.R file. This contains elements of a package to estimate probabilities of matches between records based on their pattern of agreement across fields, and impute missing agreement patterns.
+
+
+nc = detectCores()-1
+```
+
+###C. Import dataset(s) to be linked:
+
+####If reading in a very large data file is slow, you can speed things up by using readr::read_csv() and specifying the type for each column (https://cran.r-project.org/web/packages/readr/README.html)
+
+```{r}
+#dfA <- read.csv('', stringsAsFactors = FALSE) # '' = name of file or file path 
+#dfB <- read.csv('', stringsAsFactors = FALSE) #optional 
+```
+
+####Here we use some names data generated from Wikipedia (https://www.cs.jhu.edu/~npeng/papers/acl2015_mingpipe_nameMatching.pdf), and randomly assign/perturb birthdates and sex. Note that these names have different error patterns than were observed for NIDRS data, and serve mainly just to demonstrate character processing functions
+```{r}
+names = read_csv('names.csv')
+
+S1 = data.frame(names[,1]); names(S1) = 'name'
+S2 = data.frame(names[,2]); names(S2) = 'name'
+
+yobs = floor(rlnorm(nrow(S1),7.59,.005))
+mobs = round(runif(nrow(S1),.5,12.5))
+dobs = round(runif(nrow(S1),.5,31.5))
+sex = rbinom(nrow(S1),1,.5)
+
+S1$sex=sex; S1$yob = yobs; S1$mob = mobs; S1$dob = dobs
+S2$sex=sex; S2$yob = yobs; S2$mob = mobs; S2$dob = dobs
+#introduce 1% error rates into date of birth and sex in S2:
+err = rbinom(nrow(S1),1,.01); S2$sex[which(err==1)] = 1 - S2$sex[which(err==1)]
+err = rbinom(nrow(S1),1,.01); S2$yob[which(err==1)] = S2$yob[which(err==1)] + round(rnorm(sum(err), 0,2.5))
+err = rbinom(nrow(S1),1,.01); S2$mob[which(err==1)] = S2$mob[which(err==1)] + round(rnorm(sum(err), 0,1))
+err = rbinom(nrow(S1),1,.01); S2$dob[which(err==1)] = S2$dob[which(err==1)] + round(rnorm(sum(err), 0,5))
+
+#set invalid values to missing
+S2$mob[!(S2$mob %in% 1:12)] <- NA
+S2$dob[!(S2$dob %in% 1:31)] <- NA
+```
+
+##2. Data Cleaning
+
+###A. Removal of extraneous non-logogram characters from Chinese character fields, including whitespaces, alphanumeric characters, and punctuation. It can be hard to catch all of these, but string transformation at later steps can reveal extraneous characters, that can either be deleted, if they encode ambiguity or other information, processed in an alternate manner.
+
+```{r}
+clean_list = list('[A-Za-z]',' ', '/"?')
+
+for(i in clean_list){
+  S1$name <- gsub(i,'',S1$name)
+  S2$name <- gsub(i,'',S2$name)
+}
+
+```
+###(i) It is recommended to check names that appear unreasonably long for data entry errors like multiple names that are provided in a single field, e.g. 李明伦法名释明伦 or the simultaneous inclusion of another variant of a character to convey ambiguity, e.g. 李（理）明伦. 
+
+```{r}
+sus_names1 <- S1[nchar(S1$name) >= 6, ]
+sus_indices1 <- as.numeric(rownames(sus_names1))
+
+sus_names2 <- S2[nchar(S2$name) >= 6, ]
+sus_indices <- as.numeric(rownames(sus_names2))
+
+#in this example, no names have more than 5 characters
+```
+
+###(ii) Can also check for parentheses: these may encode useful ambiguity about particular characters, and utilizing this information may be an ambition of further method development. However, for now it is easier to either remove parentheses if they seem unnecessary, or remove parentheses and content inside them if it seems extraneous. 
+
+```{r}
+par_names1 <- S1[grepl('\\(',S1$name) & grepl('\\)',S1$name), ]
+par_indices1 <- as.numeric(rownames(par_names1))
+
+par_names2 <- S2[grepl('\\(',S2$name) & grepl('\\)',S2$name), ]
+par_indices2 <- as.numeric(rownames(par_names2))
+
+#Examine one name with parentheses
+par_names1
+
+action1 = cbind(par_indices1,0)
+
+action1[,2] = 1 #let 1 indicate 'clean', 2 indicated 'delete'
+#Appears that parens are unnecessary so remove them
+#recommend creating dummy indicator vectors for ambiguity, unnecessary parens, or unnecessary information inside parens and treating differently according to the indicators at each index
+
+clean_list = c(clean_list,'\\(','\\)')
+
+for(i in 1:length(par_indices1)){
+  if(action1[i,2] == 1)  S1$name[action1[i,1]] <- gsub('\\(|\\)','',S1$name[action1[i,1]])
+  if(action1[i,2] == 2){
+    stinds = grep('\\(',unlist(strsplit(S1$name[action1[i,1]],'')))
+    endinds = grep('\\)',unlist(strsplit(S1$name[action1[i,1]],'')))
+    
+    delinds = unlist(lapply(1:length(endinds),function(n) stinds[n]:endinds[n]))
+    S1$name[action1[i,1]] = paste0(unlist(strsplit(S1$name[action1[i,1]],''))[-delinds], collapse='')
+  }
+}
+```
+
+###(iii) Standardization is also advised for non-character fields, such as dates. It is generally recommended to scan each field for inappropriate values using table() or other functions, and to split fields with multiple levels of information to multiple fields (e.g. split date of birth to year, month, and day). Extraneous characters can be removed with gsub().
+
+####for example, to split dates of birth encoded in a single field, we could first coerce to a common format
+
+
+```{r}
+#dfA$DOB <- as.Date(dfA$DOB, '%m/%d/%Y')
+```
+
+And store each subfield separately
+```{r}
+#dfA$YOB <- as.numeric(format(dfA$DOB, '%Y'))
+#dfA$MOB <- as.numeric(format(dfA$DOB, '%m'))
+#dfA$dOB <- as.numeric(format(dfA$DOB, '%d')) #day of birth (dOB)
+```
+
+
+###B. Split names to family name and given name, if they are not already separated (this tends to improve linkage performance):
+
+```{r}
+S1$lname <- substr(S1$name, 1, 1)
+S1$fname <- substr(S1$name, 2, 1000000L)
+S1[S1[,]==''] <- NA #label missing data
+S1$name <- NULL #erase old column
+
+S2$lname <- substr(S2$name, 1, 1)
+S2$fname <- substr(S2$name, 2, 1000000L)
+S2[S2[,]==''] <- NA
+S2$name <- NULL
+```
+
+
+##3. Apply Transformation Functions
+
+###A. Convert Han logogram characters to their pinyin and four-corner transformations for each chinese character field:
+
+```{r}
+S1$lname.py <- ChStr2py(S1$lname, method = 'tone', multi = TRUE,sep = '') 
+S1$fname.py <- ChStr2py(S1$fname, method = 'tone', multi = TRUE,sep = '')
+
+S1$lname.fc <- ChStr2fc(S1$lname,sep = '')
+S1$fname.fc <- ChStr2fc(S1$fname, sep = '')
+
+S2$lname.py <- ChStr2py(S2$lname, method = 'tone', multi = TRUE,sep = '') 
+S2$fname.py <- ChStr2py(S2$fname, method = 'tone', multi = TRUE,sep = '')
+
+S2$lname.fc <- ChStr2fc(S2$lname,sep = '')
+S2$fname.fc <- ChStr2fc(S2$fname, sep = '')
+```
+
+
+##4. Calculate agreement between all possible record pairs in S1 and S2 for each field
+
+####The naive (and more intuitive) way to accomplish this is to make a dataframe containing the information of every possible combination of rows in S1 with rows in S2, as shown for a subset below, then carry out row-wise operations
+```{r}
+sub1 = S1[1:100,]
+sub2 = S2[1:100,]
+cartesian12 = merge(sub1,sub2,by=NULL)
+```
+
+####The size of the data is ~ N1 x N2. This quickly becomes unmanageable as the size of the data to be linked increases
+####( For internal linkage within a dataset, the size is (N^2-N)/2 )
+
+####A more efficient approach is to i). limit comparisons to unique values in each field, and store row indices associated with each unique value; ii). store agreement patterns in sparse matrices (since most fields will disagree for most record pairs); iii). store indices of missing fields in each dataset separately; iv). if any variables are to be combined (e.g. by averaging pinyin and FCC similarity scores), store unique combinations of the raw variables
+
+####This approach is implemented below
+   
+```{r}
+cols_to_link = list('sex','yob','mob','dob','lname.','fname.') #Note that lname. and fname. will select both the fc and py columns in subsequent code
+
+u_vals = lapply(cols_to_link, function(c){ #Store unique nonmissing values for each variable in a named list
+  col1 = grep(c,colnames(S1))
+  col2 = grep(c,colnames(S2))
+  list(na.omit(unique(S1[,col1])),na.omit(unique(S2[,col2])))
+}) 
+names(u_vals) = cols_to_link
+
+u_inds = new.env() #store row indices corresponding to each unique value in a hash table
+for(c in cols_to_link){
+  col1 = grep(c,colnames(S1)) 
+  col2 = grep(c,colnames(S2))
+  
+  if(length(col1)>1){
+    allvals = unique(rbind(na.omit(unique(S1[,col1])),na.omit(unique(S2[,col2]))))
+    u_inds[[c]] = apply(allvals,1, function(vals){
+      inds1 = S1[,col1[1]] == vals[1]
+      inds2 = S2[,col2[1]] == vals[1]
+      for(i in 2:length(vals)){
+        inds1 = inds1 * (S1[,col1[i]] == vals[i])
+        inds2 = inds2 * (S2[,col2[i]] == vals[i])
+      }
+      list(which(inds1==1), which(inds2==1))
+    })
+    names(u_inds[[c]]) = apply(allvals, 1, paste0,collapse='|')
+  }else{
+    allvals = na.omit(unique(c(S1[,col1],S2[,col2])))
+    u_inds[[c]] = lapply(allvals, function(val){
+      list(which(S1[,col1] == val),which(S2[,col2] == val))
+    })
+    names(u_inds[[c]]) = allvals
+  }
+}
+
+m_inds = lapply(cols_to_link, function(c){ #store missing indices for each variable in a named list
+  col1 = grep(c,colnames(S1)) #selects both lname.fc and lname.py, for example
+  col2 = grep(c,colnames(S2))
+  
+  inds1 = is.na(S1[,col1[1]])
+  inds2 = is.na(S2[,col2[1]])
+  if(length(col1)>1)
+    for(i in 2:length(col1)){
+      inds1 = pmax(inds1, is.na(S1[col1[i]]))
+      inds2 = pmax(inds2, is.na(S2[col2[i]]))
+    }
+  list(which(inds1==1),which(inds2==1))
+}) 
+names(m_inds) = cols_to_link
+
+```
+
+###Next, calculate similarity for each unique pair of character field values. Can also do this for other fields prone to entry error, but here we will treat sex, yob, mob, and dob as fields to be exactly matched, and ignore them until the next step.
+
+###- specify which variables to use partial matching on 
+###- specify which partial matching functions to use 
+
+###Depending on how many unique values are present for the character fields, this is usually the slowest step. For the example dataset, we have to make ~74 million first name comparisons and 3,215,904 last name comparisons. When we parallelize this on an i7 computer with 3 cores, the total time is ~ 30 minutes. 
+
+```{r}
+sim_vars = c('lname.','fname.')
+sim_fun = rep('sim_ld',length(sim_vars)) #levenstein (edit) similarity with functionality to handle characters with more than one pronunciation
+sims = new.env() #Store hash table of unique similarity values, each with index of unique values in u_vals used to generate them
+
+#st = Sys.time() 
+cl = makeCluster(nc) #initializing parallel backend
+registerDoParallel(cl)
+
+for(i in 1:length(sim_vars)){
+  c = sim_vars[i]
+  f = match.fun(sim_fun[i])
+  
+  u1 = u_vals[[c]][[1]]
+  u2 = u_vals[[c]][[2]]
+  d1 = max(c(length(u1),nrow(u1)))
+  d2 = max(c(length(u2),nrow(u2)))
+  
+  slices.1 = lapply(seq_len(d1 %/% 1000 + 1), 
+                    function(i) (1000*i-999) : pmin(i*1000,d1))
+    
+  slices.2 = lapply(seq_len(d2 %/% 1000 + 1), 
+                    function(i) (1000*i-999) : pmin(i*1000,d2))
+  
+  
+  for(i in 1:length(slices.1)){
+    for(j in 1:length(slices.2)){
+      temp = expand.grid(slices.1[[i]],slices.2[[j]])
+      chunksize = ceiling(nrow(temp)/nc)
+      chunks = lapply(seq_len(nc),
+                      function(i) (chunksize*i-chunksize + 1) : pmin(i*chunksize,nrow(temp)))
+      
+      if(class(u_vals[[c]][[1]]) %in% c('data.frame','matrix')){
+              
+            sim = foreach(i = 1:nc, .combine = 'c') %dopar% {
+              library(stringdist)
+              f(u1[temp[chunks[[i]],1],],u2[temp[chunks[[i]],2],])
+            }
+        
+      }else{
+      
+            sim = foreach(i = 1:nc, .combine = 'c') %dopar% {
+              library(stringdist)
+              f(u1[temp[chunks[[i]],1]],u2[temp[chunks[[i]],2]])
+            }
+      }
+      usims = unique(sim)
+      chunksize = ceiling(length(usims)/nc)
+      chunks = lapply(seq_len(nc),
+                      function(i) (chunksize*i-chunksize + 1) : pmin(i*chunksize,length(usims)))
+      
+      sims[[c]][[length(slices.2) * (i-1) + j]]= foreach(i = 1:nc,.combine='c') %dopar% {
+        sims_ = list()
+        for(s in usims[chunks[[i]]])
+          sims_[[sprintf("%0.17f",s)]] <- temp[sim == s, ]
+        sims_
+      }
+      cat(((i-1)*length(slices.2) + j)/(length(slices.1)*length(slices.2)) * 100, '% Complete for variable', c,'\n')
+    }
+  }
+  usims = unique(do.call('c',lapply(sims[[c]],names)))
+  sims[[c]] = lapply(usims, function(s){
+    do.call(rbind,lapply(sims[[c]],'[[',s))
+  })
+  names(sims[[c]]) = usims
+} 
+
+#en = Sys.time() 
+stopCluster(cl)
+rm(list = c('temp', 'u1','u2','d1','d2','usims','sim','slices.1','slices.2','chunks','chunksize'))
+gc()
+```
+
+####Recommended: to save work, export the current environment and re-import at a later time if necessary.
+```{r}
+#save(list = ls(all.names = T), file = 'linkage_1.RData')
+#load('linkage_1.RData')
+```
+
+###Now declare agreement between record pairs on each field to be linked, based on exact matching or calculated similarities. 
+
+####These agreement patterns will be stored in high dimensional sparse matrices, one for each matching variable. In this way, only the entries that agree or that are missing need be stored for each field.
+
+####Note that in order to convert similarity to agreement, thresholds must be set for partial matching. Based on our research to date, we currently recommend thresholds of 0.75 for first names and 0.85 for family names when using the averaged pinyin and four corner edit similarities.
+
+```{r}
+thr = list('fname.' = 0.75, 'lname.'= 0.85)
+
+SpMats = vector('list',length=length(cols_to_link)) #list of sparse matrices, each of which stores the agreement for all record pairs of in one field (e.g. sparse matrix 1 has the agreement of S1[4,] and S2[22,] on sex in index [4,22])
+names(SpMats) = cols_to_link
+for(c in cols_to_link){
+  if(c %in% sim_vars){
+    todo = which(as.numeric(names(sims[[c]])) >=  thr[[c]])
+    todo = do.call(rbind,sims[[c]][todo])
+    
+    uvalnames = lapply(u_vals[[c]],apply,1,paste0,collapse='|')
+    temp = do.call(rbind,apply(todo,1,function(v){
+      ID1 = uvalnames[[1]][v[1]]
+      ID2 = uvalnames[[2]][v[2]]
+      
+      expand.grid(u_inds[[c]][[ID1]][[1]], u_inds[[c]][[ID2]][[2]])
+    }))
+    
+    tempm = unique(rbind(expand.grid(m_inds[[c]][[1]],1:nrow(S2)),expand.grid(1:nrow(S1),m_inds[[c]][[2]])))
+    
+  }else{
+    temp = do.call(rbind,lapply(u_inds[[c]], expand.grid)) #store coordinates of every exact match
+    tempm = unique(rbind(expand.grid(m_inds[[c]][[1]],1:nrow(S2)),expand.grid(1:nrow(S1),m_inds[[c]][[2]])))
+  }
+  SpMats[[c]] = sparseMatrix(i = c(temp[,1],tempm[,1]), 
+                               j = c(temp[,2],tempm[,2]),
+                               x = c(rep(1,nrow(temp)), rep(999, nrow(tempm))),
+                               dims = c(nrow=nrow(S1), ncol = nrow(S2)))
+}
+rm(list = c('temp','tempm','uvalnames'))
+gc()
+```
+
+##5. Generate a frequency table of agreement patterns for all fields
+
+####And save indices of record pairs that could potentially be linked (i.e. match on either first name or last name, as well as at least 2 of sex, yob, mob, dob)
+```{r}
+atleasttwocols = function(v){
+  matches = list()
+  tmatches = list()
+  for(i in 1:(length(v)-1)){
+    matches[[i]] = which(SpMats[[v[i]]] == 1)
+    tmatches[[i]] = list()
+    for(j in (i+1):length(v)){
+      tmatches[[i]][[j-i]] = matches[[i]][which(SpMats[[v[j]]][matches[[i]]]==1)]
+    }
+    matches[[i]] = unique(unlist(tmatches[[i]]))
+  }
+  unique(unlist(matches))
+}
+
+suff_cols = c('fname.','lname.') #fields for which a match qualifies the associated indices to be stored
+part_cols = c('sex','yob','mob','dob') #A match on at least two of these fields will be required to store the associated indices
+
+todo = unique(unlist(lapply(suff_cols, function(c) which(SpMats[[c]] == 1)))) #long matrix of indices to find agreement patterns and store 
+todo = unique(c(todo, atleasttwocols(part_cols)))
+
+slices = lapply(seq_len(length(todo) %/% 1e6 + 1),
+                function(i) (1e6 * i - 1e6 + 1):pmin(1e6*i,length(todo)))
+
+cl = makeCluster(nc) #Initializing parallel backend
+registerDoParallel(cl)
+
+patlist = foreach(i = 1:length(slices)) %dopar% {
+  library(Matrix)
+  inds = todo[slices[[i]]]
+  i_s = inds %% nrow(S1)
+  i_s[i_s==0] = nrow(S1)
+  j_s = inds %/% nrow(S1) + 1
+  
+  pat = matrix(nrow = length(inds), ncol = length(cols_to_link))
+  
+  for(c in 1:length(cols_to_link)){
+    pat[,c] = SpMats[[c]][inds]
+  }
+  colnames(pat) = cols_to_link
+  
+  pats = unique(pat)
+  pats = apply(pats,1,paste0,collapse='')
+  pats_ = apply(pat,1,paste0,collapse='')
+  plist = vector('list',length(pats))
+  names(plist) = pats
+  
+  for(i in 1:length(pats)){
+    pinds = which(pats_==pats[i])
+    plist[[pats[i]]] = cbind(i_s[pinds],j_s[pinds])
+  }
+  
+  freqtab = plyr::count(pat)
+  list(freqtab,plist)
+}
+
+mastertable = do.call(rbind,lapply(patlist,'[[',1)) #contingency table of frequency of each observed agreement pattern
+savepats = unique(unlist(lapply(lapply(patlist,'[[',2),names)))
+patt_inds = lapply(savepats, function(p) do.call(rbind,lapply(patlist,function(l) l[[2]][[p]]))) #named list of agreement patterns with stored indices, i.e. those that are possible matches a priori
+
+names(patt_inds) = savepats
+colnames(mastertable) = c(cols_to_link,'counts')
+mastertable = mastertable %>% group_by(sex,yob,mob,dob,lname.,fname.) %>% summarise(counts = sum(counts))
+
+allpats = rep(list(c(0,1)),length(cols_to_link))
+names(allpats) = cols_to_link
+for(c in cols_to_link){ #filling in remaining patterns in contingency table
+  if(max(unlist(sapply(m_inds[[c]],length))) > 0) allpats[[c]] = c(allpats[[c]],999)
+}
+
+allpats = expand.grid(allpats)
+allpats_ = apply(allpats,1,paste0,collapse='')
+
+allpats = allpats[-which(allpats_ %in% savepats),]
+
+newcounts = foreach(p = 1:nrow(allpats),.combine='c') %dopar% { #this step takes a while
+    
+    v = unlist(allpats[p,])
+    cands = which(SpMats[[1]]==v[1])
+    for(m in 2:length(SpMats)){
+      cands = intersect(cands, which(SpMats[[m]] == v[m]))
+    }
+    length(cands)
+  }
+  
+newfreqs = cbind(allpats,newcounts)
+colnames(newfreqs) = colnames(mastertable)
+mastertable = rbind(data.frame(mastertable),newfreqs)
+mastertable = subset(mastertable,counts>0)
+mastertable[mastertable==999] = NA
+
+stopCluster(cl)
+
+rm(list=c('newfreqs', 'newcounts', 'allpats_', 'allpats', 'savepats', 'patlist', 'slices', 'suff_cols', 'part_cols','todo'))
+#rm('Spmats') Typically we'd remove these large sparse matrices, but we use the sparse matrix objects later on to check model fit, since we know which indices correspond to matches
+gc()
+```
+
+##6. Run probabilistic linkage models using the counts of observed agreement patterns to estimate the probability that record pairs with each pattern are matches.
+
+####The function linkd will run a routine to impute missing data, then estimate the matching probabilities for each pattern. The argument alg determines whether interaction terms expressing dependence between agreement fields (e.g. probability of agreeing on first name depends on agreement on sex) are fit for matches and nonmatches. Options are:
+
+####'i' - independence : No interaction terms are fit
+####'m' - match-level interaction : Interaction terms are added for supposed matching record pairs through stepwise model selection
+####'b' - both-levels interaction : Interaction terms are added for both matching and nonmatching record pairs through stepwise model selection
+
+####Our current recommendation is to fit each algorithm separately, inspect interaction terms to see whether they make sense, then use goodness of fit tests to select between them. Another option is to check correlation residual plots for evidence that a model has failed to account for substantial dependence between variables. It is also recommended to check the interaction terms included in fitted models, and consider deleting terms that seem poorly identified or illogical. We anticipate adding a future option 'f' for fitting algorithms with pre-specified formulae.
+
+```{r}
+ifit = linkd(mastertable, alg = 'i')
+mfit = linkd(mastertable, alg = 'm')
+bfit = linkd(mastertable, alg = 'b')
+```
+
+####Each fitted object contains a). fitted_probs: A dataframe of the agreement patterns with their frequencies and predicted match probabilities; b). fitted_models: A list with regression models for matched and nonmatched records, p, the estimated proportion of record pairs that are matches, and probs, estimated matching probabilities for the full contingency table of agreement patterns; c). imputed_freqs: the imputed full contingency table of agreement patterns with no missingness.
+
+####Let's begin by investigating the interaction terms added by mfit and bfit
+
+```{r}
+summary(bfit$fitted_models$model_match)
+summary(mfit$fitted_models$model_match)
+```
+
+####Interaction terms added indicate that among true matches date of birth fields are more likely to agree if other date of birth fields agree. This seems plausible, though in this simulation, we know it doesn't match the way in which the data were generated. Additionally, the mfit terms for date of birth fields indicate that partial matches on date of birth are expected to be unlikely among matches, and even matching on all date of birth terms yields a coefficient of -2.99 + -2.04 + -3.13 + 2.26 + 6.80 = 0.9, which is the inverse logit of the probability of observing this pattern among matches, meaning we only expect exp(.9)/(1+exp(.9)) = 71% of matches to agree on all birthdate fields. This may seem a little low (whereas in the b fit, we expect 99.99% to match, which may seem a little too high!).
+
+
+####Now we inspect the nonmatch interactions in the b fit
+```{r}
+summary(bfit$fitted_models$model_mismatch)
+```
+####The only interaction added indicates that nonmatching records are more likely to match on one of the name fields if they match on the other name field as well, which is what we might expect if the two records truly have the same full name. This would seem reasonable if it were in the model_match layer, but doesn't seem logical in the model_mismatch layer. 
+
+####Now let's inspect correlation residual plots
+
+####(mcorr is a function to estimate pairwise correlations between fields predicted from model outputs)
+####(bcorr is a function to estimate pairwise correlations between fields observed in the data)
+```{r}
+plot(mcorr(ifit$fitted_models,ifit$imputed_freqs)-bcorr(ifit$imputed_freqs),ylim=c(-.25,.25), type='l',main='independence',ylab = 'correlation error', xlab = '')
+text(x = 1:length(bcorr(ifit$imputed_freqs)), y = mcorr(ifit$fitted_models,ifit$imputed_freqs)-bcorr(ifit$imputed_freqs) +  0.1,labels= names(bcorr(ifit$imputed_freqs)), cex = .8, srt = 60)
+plot(mcorr(mfit$fitted_models,mfit$imputed_freqs)-bcorr(mfit$imputed_freqs),ylim=c(-.25,.25), type='l',main='match interactions',ylab = 'correlation error', xlab = '')
+text(x = 1:length(bcorr(ifit$imputed_freqs)), y = mcorr(mfit$fitted_models,ifit$imputed_freqs)-bcorr(ifit$imputed_freqs) +  0.1,labels= names(bcorr(ifit$imputed_freqs)), cex = .8, srt = 60)
+plot(mcorr(bfit$fitted_models,bfit$imputed_freqs)-bcorr(bfit$imputed_freqs),ylim=c(-.25,.25), type='l',main='all interactions',ylab = 'correlation error', xlab = '')
+text(x = 1:length(bcorr(ifit$imputed_freqs)), y = mcorr(bfit$fitted_models,ifit$imputed_freqs)-bcorr(ifit$imputed_freqs) +  0.1,labels= names(bcorr(ifit$imputed_freqs)), cex = .8, srt = 60)
+```
+####Ideally these plots are centered at 0 and show minimal random deviation around 0. In this example, there's some evidence of interaction between first name and last name (the last plotted correlation), which is accounted for in the interaction models, but there aren't any very strong correlations.
+
+####Now let's inspect model fit criteria (Mixture Regression Criterion) https://gsm.ucdavis.edu/sites/main/files/file-attachments/05extendingtheakaike.pdf
+```{r}
+ifit$fitted_models$MRC
+mfit$fitted_models$MRC
+bfit$fitted_models$MRC
+```
+####Based on these numbers, the bfit models seem superior.
+
+####As seen here, making a judgement call on which model to use without knowledge of true match status can be difficult. Fortunately, in this example, we know which rows should be matched (row S1[n,] to row S2[n,]) and can also calculate the correlation of fitted probabilities from each model with true matching proportions.
+
+```{r}
+matchpats = do.call(cbind,lapply(SpMats,diag))
+matchpats = plyr::count(matchpats)
+matchfreqs = matchpats$freq
+
+allpats = mastertable
+allpats[is.na(allpats)] = 999
+
+matchpats = apply(matchpats[,1:length(cols_to_link)],1,paste0,collapse='')
+allpats_ = apply(allpats[,1:length(cols_to_link)],1,paste0,collapse='')
+
+allcounts = mastertable$counts
+trueprobs = allcounts * 0
+for(i in 1:length(matchpats)){
+  p = matchpats[i]
+  i2 = which(allpats_==p)
+  trueprobs[i2] = matchfreqs[i]/allcounts[i2]
+}
+
+iprobs = ifit$fitted_probs$fitted_prob_match
+mprobs = mfit$fitted_probs$fitted_prob_match
+bprobs = bfit$fitted_probs$fitted_prob_match
+
+df = data.frame(trueprobs,iprobs,mprobs,bprobs,counts = mastertable$counts)
+
+ir2 = summary(lm(trueprobs ~ iprobs))$r.squared
+mr2 = summary(lm(trueprobs ~ mprobs))$r.squared
+br2 = summary(lm(trueprobs ~ bprobs))$r.squared
+```
+
+```{r}
+ggplot(df) + stat_smooth(aes(x = iprobs, y = trueprobs), formula = y ~ x,method='lm',col='black', alpha = 0.5) + geom_point(aes(x = iprobs, y = trueprobs, size = log(counts)), col='black', alpha = 0.5) + ggtitle(paste('Independence \n R^2 =',ir2))
+ggplot(df) + stat_smooth(aes(x = mprobs, y = trueprobs), formula = y ~ x,method='lm',col='navy', alpha = 0.5) + geom_point(aes(x = mprobs, y = trueprobs, size = log(counts)), col='navy', alpha = 0.5) + ggtitle(paste('Interactions in Matching Category \n R^2 =',mr2))
+ggplot(df) + stat_smooth(aes(x = bprobs, y = trueprobs), formula = y ~ x,method='lm',col='blue', alpha = 0.5) + geom_point(aes(x = bprobs, y = trueprobs, size = log(counts)), col='blue', alpha = 0.5) + ggtitle(paste('Interactions in both Categories \n R^2 =',br2))
+```
+####So the full interaction model does actually improve the fit overall by doing a better job at excluding false matches (though some true matches are underestimated). The m model is, on the other hand, much worse than the independence model! Perhaps there is some property of the names or our partial agreement functions that resulted in the observed dependence between first and last name agreement among nonmatches.
+
+
+
+# Post-Processing Steps
+
+##7. Setting thresholds to declare matches, non-matches, and pairs for clerical review
+
+####To define linkages, nonlinkages, and records for clerical review, we must establish lower and upper thresholds on the posterior probability of matching. Everything below the lower threshold will be rejected. Everything above the upper threshold will be accepted as a link (with possible deduplication). Everything between the two thresholds will be recommended for clerical review. Note that the fitted probabilities and counts themselves might be more useful if properly incorporated into posterior analyses.
+
+####To determine thresholds, first set acceptable type 1 and type 2 error rates. These might be difficult to determine, and will be application dependent, but the following seem reasonable based on our explorations into CRC bias assuming 2 independent lists and a maximum 10% capture probability.
+
+```{r}
+p_FP = 0.01
+p_FN = 0.05
+```
+
+####In this example, we will define p_FP as the proportion of accepted links that are estimated to be nonmatches, and p_FN as the proportion of total matches that are rejected.
+
+####For the sake of comparison, we will see how many records are declared as links, nonlinks, and sent to review by each model, as well as the true error rates in the linked and nonlinked decision categories.
+
+###Independence model
+```{r}
+freqtable = data.frame(cbind(ifit$fitted_probs,trueprobs) %>% arrange(desc(fitted_prob_match))) #sort agreement patterns in descending order of match probability
+
+propFP = cumsum(freqtable$counts * (1-freqtable$fitted_prob_match))/cumsum(freqtable$counts)
+#calculate the proportion of predicted nonmatches associated with an upper threshold at each possible value
+thr.high = freqtable$fitted_prob_match[sum(propFP <= p_FP)]
+
+freqtable = freqtable %>% arrange(fitted_prob_match) #re-sort in ascending order of matching probability
+
+propFN = cumsum(freqtable$counts * freqtable$fitted_prob_match)/sum(freqtable$counts * freqtable$fitted_prob_match)
+#calculate the predicted proportion of total matches excluded at each possible lower threshold value
+thr.low = freqtable$fitted_prob_match[sum(propFN <= p_FN)]
+
+cat('# declared nonlinks by independence model is', sum(freqtable$counts[freqtable$fitted_prob_match<=thr.low]),'\n')
+cat('# declared links by independence model is', sum(freqtable$counts[freqtable$fitted_prob_match>=thr.high]),'\n')
+cat('# record pairs for clerical review under independence model is', sum(freqtable$counts[freqtable$fitted_prob_match<thr.high & freqtable$fitted_prob_match>thr.low]),'\n')
+
+cat('# of declared links that are correct under independence model is', sum(freqtable$counts[freqtable$fitted_prob_match>=thr.high] * freqtable$trueprobs[freqtable$fitted_prob_match>=thr.high]),'/',sum(freqtable$counts[freqtable$fitted_prob_match>=thr.high]),' = ',sum(freqtable$counts[freqtable$fitted_prob_match>=thr.high] * freqtable$trueprobs[freqtable$fitted_prob_match>=thr.high])/sum(freqtable$counts[freqtable$fitted_prob_match>=thr.high]),'\n')
+```
+
+###Interaction model among matches only
+
+```{r}
+freqtable = data.frame(cbind(mfit$fitted_probs,trueprobs) %>% arrange(desc(fitted_prob_match))) #sort agreement patterns in descending order of match probability
+
+propFP = cumsum(freqtable$counts * (1-freqtable$fitted_prob_match))/cumsum(freqtable$counts)
+#calculate the proportion of predicted nonmatches associated with an upper threshold at each possible value
+thr.high = freqtable$fitted_prob_match[sum(propFP <= p_FP)]
+
+freqtable = freqtable %>% arrange(fitted_prob_match) #re-sort in ascending order of matching probability
+
+propFN = cumsum(freqtable$counts * freqtable$fitted_prob_match)/sum(freqtable$counts * freqtable$fitted_prob_match)
+#calculate the predicted proportion of total matches excluded at each possible lower threshold value
+thr.low = max(c(min(freqtable$fitted_prob_match),freqtable$fitted_prob_match[sum(propFN <= p_FN)]))
+
+cat('# declared nonlinks by match interaction model is', sum(freqtable$counts[freqtable$fitted_prob_match<=thr.low]),'\n')
+cat('# declared links by match interaction model is', sum(freqtable$counts[freqtable$fitted_prob_match>=thr.high]),'\n')
+cat('# record pairs for clerical review under match interaction model is', sum(freqtable$counts[freqtable$fitted_prob_match<thr.high & freqtable$fitted_prob_match>thr.low]),'\n')
+
+cat('# of declared links that are correct under match interaction model is', sum(freqtable$counts[freqtable$fitted_prob_match>=thr.high] * freqtable$trueprobs[freqtable$fitted_prob_match>=thr.high]),'/',sum(freqtable$counts[freqtable$fitted_prob_match>=thr.high]),' = ',sum(freqtable$counts[freqtable$fitted_prob_match>=thr.high] * freqtable$trueprobs[freqtable$fitted_prob_match>=thr.high])/sum(freqtable$counts[freqtable$fitted_prob_match>=thr.high]),'\n')
+```
+
+
+
+###Interaction model among both matches and nonmatches
+
+```{r}
+freqtable = data.frame(cbind(bfit$fitted_probs,trueprobs) %>% arrange(desc(fitted_prob_match))) #sort agreement patterns in descending order of match probability
+
+propFP = cumsum(freqtable$counts * (1-freqtable$fitted_prob_match))/cumsum(freqtable$counts)
+#calculate the proportion of predicted nonmatches associated with an upper threshold at each possible value
+thr.high = freqtable$fitted_prob_match[sum(propFP <= p_FP)]
+
+freqtable = freqtable %>% arrange(fitted_prob_match) #re-sort in ascending order of matching probability
+
+propFN = cumsum(freqtable$counts * freqtable$fitted_prob_match)/sum(freqtable$counts * freqtable$fitted_prob_match)
+#calculate the predicted proportion of total matches excluded at each possible lower threshold value
+thr.low = max(c(min(freqtable$fitted_prob_match),freqtable$fitted_prob_match[sum(propFN <= p_FN)]))
+
+cat('# declared nonlinks by full interaction model is', sum(freqtable$counts[freqtable$fitted_prob_match<=thr.low]),'\n')
+cat('# declared links by full interaction model is', sum(freqtable$counts[freqtable$fitted_prob_match>=thr.high]),'\n')
+cat('# record pairs for clerical review under full interaction model is', sum(freqtable$counts[freqtable$fitted_prob_match<thr.high & freqtable$fitted_prob_match>thr.low]),'\n')
+
+cat('# of declared links that are correct under full interaction model is', sum(freqtable$counts[freqtable$fitted_prob_match>=thr.high] * freqtable$trueprobs[freqtable$fitted_prob_match>=thr.high]),'/',sum(freqtable$counts[freqtable$fitted_prob_match>=thr.high]),' = ',sum(freqtable$counts[freqtable$fitted_prob_match>=thr.high] * freqtable$trueprobs[freqtable$fitted_prob_match>=thr.high])/sum(freqtable$counts[freqtable$fitted_prob_match>=thr.high]),'\n')
+```
+
+####Under these decision rules, the independence and full interaction models do reasonably well in terms of the proportion of declared links that are correct, and leave a moderate number of record pairs for clerical review.  
+
+####For the sake of demonstration, we create the linked dataset using the full interaction model:
+
+```{r}
+whichpats = subset(freqtable, fitted_prob_match >= thr.high)[1:length(cols_to_link)]
+whichpats[is.na(whichpats)] = 999
+whichpats = apply(whichpats,1,paste0,collapse='')
+
+link_inds = do.call(rbind,lapply(whichpats,function(p) patt_inds[[p]]))
+
+linked_db = cbind(S1[link_inds[,1], ], S2[link_inds[,2],])
+linked_db = linked_db[,order(colnames(linked_db))]
+colnames(linked_db) = paste0(rep(c('S1.','S2.'),ncol(S1)),colnames(linked_db))
+colnames(linked_db) = gsub('.1$','',colnames(linked_db))
+
+View(linked_db)
+```
+
+
+####And illustrate manual review process
+```{r}
+whichpats = subset(freqtable, fitted_prob_match < thr.high & fitted_prob_match > thr.low)[1:length(cols_to_link)]
+whichpats[is.na(whichpats)] = 999
+whichpats = apply(whichpats,1,paste0,collapse='')
+
+rev_inds = do.call(rbind,lapply(whichpats,function(p) patt_inds[[p]]))
+
+man_reviewer = function(DB1, DB2, inds, oldres = NULL){
+  
+  i = 1
+  linked = vector(length=nrow(inds))
+  
+  if(is.list(oldres)){
+    i = oldres$i
+    linked = oldres$linked
+  } 
+  quitswitch = 'n'
+  
+  while(quitswitch != 'q' & i <= nrow(inds)){
+    print(rbind(DB1[inds[i,1],],DB2[inds[i,2],]))
+    
+    quitswitch = readline("To your judgement, do the above records correspond to the same person? Enter 1 for yes, 0 for no, or q to save and quit")
+    
+    while(!(quitswitch %in% c('q','1','0')))  quitswitch = readline("Invalid input, please retry. Enter 1 for yes, 0 for no, or q to save and quit")
+    if(quitswitch %in% c('0','1')){
+      linked[i] = as.numeric(quitswitch)
+      i = i + 1
+    }
+  }
+  return(list('i'=i,'linked' = linked))
+}
+
+man_res = man_reviewer(S1,S2,rev_inds) 
+#work can be saved and continued by adding man_res = man_reviewer(S1,S2,rev_inds,man_res)
+```
+
+
+
+#Areas for future development:
+
+##-Improved string comparators for Chinese character data
+##-Iterative linkage methods to gradually improve model performance and reduce manual review
+##-Multi-list linkage
+##-Linkage models with multiple agreement levels
+##-Streamlining of user interface / functions
+##-Linear sum assignment algorithm to deduplicate automatically accepted links
+##-Increased scalability
