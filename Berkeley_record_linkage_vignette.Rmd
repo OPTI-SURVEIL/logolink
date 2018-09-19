@@ -29,6 +29,7 @@ NOTE: For execution of the algorithms on the example dataset, at least 8 GB RAM 
 ###A. Ensure the system locale is set to Chinese (otherwise Chinese characters are parsed incorrectly):
 ```{r}
 Sys.setlocale(category = 'LC_ALL', locale = 'chs')
+set.seed(13597)
 ```
 
 ###B. Import required libraries:
@@ -93,6 +94,11 @@ err = rbinom(nrow(S1),1,.01); S2$dob[which(err==1)] = S2$dob[which(err==1)] + ro
 #set invalid values to missing
 S2$mob[!(S2$mob %in% 1:12)] <- NA
 S2$dob[!(S2$dob %in% 1:31)] <- NA
+
+#uncomment these lines to store copies of the generated datasets
+#write_csv(S1,'dfA.csv')
+#write_csv(S2,'dfB.csv')
+
 ```
 
 ##2. Data Cleaning
